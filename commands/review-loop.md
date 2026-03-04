@@ -154,15 +154,63 @@ issue がない場合は以下を出力:
    - Go: `go vet ./...` && `go build ./...`
 4. ビルド/テストが壊れた場合は修正をリバートし、issue をスキップ
 
-#### Step 2d: 収束判定
+#### Step 2d: ラウンド結果の保存
+
+各ラウンド完了時に `.claude/reviews/` に Markdown ファイルを書き出す。
+
+**ファイルパス**: `.claude/reviews/{YYYY-MM-DD}-{short-description}-round{N}.md`
+
+**フォーマット**:
+
+```markdown
+# Review Round {N} — {date}
+
+## Context
+- **Branch**: {branch name}
+- **Diff stat**: {files changed, insertions, deletions}
+- **Language**: {detected language/framework}
+- **Severity filter**: {threshold}
+
+## Reviewer Results
+
+### Security & Memory Safety (opus)
+{JSON Lines output from reviewer, as-is}
+
+### Logic & Correctness (opus)
+{JSON Lines output from reviewer, as-is}
+
+### Performance & Design (opus)
+{JSON Lines output from reviewer, as-is}
+
+### Codex (if --codex)
+{output from codex, if applicable}
+
+## Aggregated Issues (after dedup + cross-validation)
+| # | Severity | File | Line | Title | Reviewers | Status |
+|---|----------|------|------|-------|-----------|--------|
+| 1 | critical | path | 42   | ...   | Sec+Logic | Fixed  |
+
+## Fixes Applied
+{brief description of each fix, or "Report only (--auto-fix=false)"}
+
+## Build Verification
+- `cargo check`: {pass/fail}
+- `cargo test`: {pass/fail, N tests}
+```
+
+Write ツールで `.claude/reviews/` ディレクトリに書き出す。ディレクトリが存在しない場合は作成する。
+
+#### Step 2e: 収束判定
 
 - 今ラウンドで severity >= threshold の issue が **0件** → **収束**。ループ終了
 - issue が前ラウンドより増えた → 修正が新たな問題を生んでいる可能性。ユーザーに確認
 - 最大ラウンドに到達 → 残存 issue を報告して終了
 
-### Phase 3: 結果サマリー
+### Phase 3: 結果サマリーの保存と出力
 
-最終的に以下を出力:
+最終サマリーを `.claude/reviews/{YYYY-MM-DD}-{short-description}-summary.md` に保存し、コンソールにも出力する。
+
+最終的に以下を出力・保存:
 
 ```markdown
 ## Review Loop Summary
