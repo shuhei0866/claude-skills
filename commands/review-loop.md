@@ -17,7 +17,7 @@ allowed-tools:
 ローカルの変更に対して「レビュー → 修正 → 再レビュー」を issue が 0 になる（または最大ラウンド数に達する）まで繰り返します。
 LLM レビューは1回ごとに新しい視点で問題を発見するため、複数ラウンド回すことで品質が漸近的に向上します。
 
-**Announce at start:** "Review Loop を開始します。変更を分析して、収束するまでレビュー→修正を繰り返します。"
+**Announce at start:** "Review Loop を開始します。変更を分析して、観点別の並列レビューを収束するまで繰り返します。"
 
 ## 引数
 
@@ -27,93 +27,136 @@ $ARGUMENTS
 - `--severity=critical|high|medium|all` (default: high): 修正対象とする最低重要度
 - `--auto-fix` (default: true): 発見した問題を自動修正する。false なら報告のみ
 - `--scope=staged|all|file=<path>` (default: all): レビュー対象
-- `--focus=security|bugs|performance|all` (default: all): 重点観点
+- `--codex` (default: false): OpenAI Codex にも並列でレビューさせる（モデル多様性）
 
 ## ワークフロー
 
 ### Phase 1: 変更の把握
 
 1. `git diff HEAD --stat` で変更ファイル一覧を取得
-2. 変更が大きい場合 (20ファイル超) はファイルをグループ化して並列レビュー
+2. `git diff HEAD` で全 diff を取得
 3. プロジェクトの言語・フレームワークを検出（Cargo.toml, package.json, go.mod 等）
+4. ビルドコマンドとテストコマンドを特定
 
 ### Phase 2: レビューループ
 
 以下を `max-rounds` 回まで繰り返す:
 
-#### Step 2a: レビュー実行
+#### Step 2a: 観点別並列レビュー
 
-Agent ツールで独立コンテキストのレビューサブエージェントを起動する。
+**各ラウンドで 3〜4 個のサブエージェントを同時起動する。** 各エージェントは異なる観点に特化し、独立コンテキストで動く。これにより広さと深さの両方を確保する。
 
 **重要**: 毎ラウンド新しいサブエージェントを起動すること（前ラウンドの修正バイアスを避けるため）。
 
-サブエージェントの設定:
+全サブエージェントを **1つのメッセージ内で並列に Agent ツール呼び出し** して同時起動すること。
+
+##### Reviewer 1: セキュリティ & メモリ安全性
+
 - **subagent_type**: `general-purpose`
-- **model**: `sonnet`（コスト効率。Critical issue が見つかった場合のみ opus で再検証）
-- **prompt**: 以下を含める:
+- **model**: `opus`
+- **prompt の観点**:
+  - インジェクション (SQL, XSS, コマンド, パストラバーサル)
+  - 認証・認可の不備、権限昇格
+  - 機密情報のハードコード・ログ出力
+  - バッファオーバーフロー、unbounded allocation、OOM
+  - デッドロック、TOCTOU、競合状態
+  - 暗号・乱数の誤用
+  - FFI 安全性 (unsafe ブロック、null ポインタ、ライフタイム)
+
+##### Reviewer 2: ロジック & 正確性
+
+- **subagent_type**: `general-purpose`
+- **model**: `opus`
+- **prompt の観点**:
+  - 境界値・エッジケースの未処理 (空配列、0、MAX、負数)
+  - null/None/undefined の未チェック
+  - エラーハンドリング不備 (unwrap/panic in production paths)
+  - API 契約違反 (引数の型・範囲、戻り値の意味)
+  - リソースリーク (未 close、未 dispose、未 drop)
+  - 状態遷移の不整合、イベント順序の前提違反
+  - off-by-one エラー、型変換の truncation/overflow
+
+##### Reviewer 3: パフォーマンス & 設計
+
+- **subagent_type**: `general-purpose`
+- **model**: `opus`
+- **prompt の観点**:
+  - O(n^2) 以上のアルゴリズム、N+1 クエリ
+  - 不要なクローン/コピー/アロケーション
+  - ブロッキング I/O in async コンテキスト
+  - 入力バリデーション不足 (外部入力の信頼)
+  - timeout/上限なしのネットワーク・ファイル操作
+  - ロック粒度の粗さ、ホットパスの非効率
+
+##### Reviewer 4 (オプション: --codex 指定時): Codex レビュー
+
+`--codex` が指定された場合、追加で Codex にもレビューさせる。
+Bash ツールで `codex` CLI を呼び出し、diff を渡してレビュー結果を取得する。
+異なるモデルファミリーは異なる盲点を持つため、多様性が品質を高める。
+
+#### 各レビュワー共通の出力フォーマット指示
+
+各サブエージェントのプロンプトに以下を含める:
 
 ```
-あなたはコードレビュワーです。以下の diff を客観的にレビューしてください。
+あなたは {観点名} の専門レビュワーです。以下の diff をあなたの専門観点のみからレビューしてください。
+他の観点（例: セキュリティ担当なのにスタイルを指摘する）は別のレビュワーが担当するので不要です。
 
-## レビュー観点 (重要度順)
+## 対象コード
 
-### Critical (必ず報告)
-- セキュリティ脆弱性 (injection, XSS, auth bypass, secrets)
-- データ損失の可能性
-- デッドロック、無限ループ
-- メモリ安全性 (use-after-free, buffer overflow, unbounded allocation)
+{diff の内容}
 
-### High (デフォルトで修正対象)
-- バグ: 境界値未処理、null 未チェック、競合状態
-- エラーハンドリング不備 (unwrap/panic in production paths)
-- リソースリーク (未 close、未 dispose)
-- API 契約違反
+## プロジェクトコンテキスト
 
-### Medium
-- パフォーマンス: N+1、不要なクローン/コピー、O(n^2)
-- 入力バリデーション不足
-- エラーメッセージの不親切さ
+- 言語/フレームワーク: {検出結果}
+- 変更ファイル数: {N}
+- 変更行数: {M}
 
-### Low (報告のみ、修正しない)
-- コードスタイル、命名
-- ドキュメント不足
-- 理想的だが必須ではない改善
+## 重要度の定義
 
-## 出力フォーマット
+- **critical**: 本番で確実に問題になる。データ損失、セキュリティ侵害、クラッシュ
+- **high**: 高確率でバグになる。特定条件でのみ発現する可能性
+- **medium**: 改善すべきだが直ちに問題にはならない
+- **low**: あれば良い程度の改善（これは報告しなくてよい）
+
+## 出力
 
 各 issue を以下の JSON Lines で出力してください（説明テキスト不要、JSON のみ）:
 
-{"severity":"critical|high|medium|low","file":"path/to/file.rs","line":42,"title":"短い要約","description":"問題の詳細と修正方針","fix_suggestion":"具体的なコード修正案（あれば）"}
+{"severity":"critical|high|medium","file":"path/to/file.rs","line":42,"title":"短い要約","description":"問題の詳細と修正方針","fix_suggestion":"具体的なコード修正案（あれば）"}
 
 issue がない場合は以下を出力:
 {"severity":"none","title":"No issues found"}
 ```
 
-#### Step 2b: 結果のパース
+#### Step 2b: 結果の統合 & 重複排除
 
-サブエージェントの出力から JSON Lines を抽出し、severity でフィルタリング:
-- `--severity=critical` → critical のみ
-- `--severity=high` → critical + high
-- `--severity=medium` → critical + high + medium
-- `--severity=all` → 全部
+1. 全レビュワーの出力を収集
+2. JSON Lines をパース
+3. 同一ファイル・同一行の重複 issue をマージ（複数レビュワーが同じ問題を指摘 → 確信度が高い）
+4. severity でフィルタリング:
+   - `--severity=critical` → critical のみ
+   - `--severity=high` → critical + high (デフォルト)
+   - `--severity=medium` → critical + high + medium
+   - `--severity=all` → 全部
+5. 複数レビュワーが指摘した issue は severity を1段階上げる（cross-validated）
 
 #### Step 2c: 修正の適用
 
 `--auto-fix` が true の場合:
 
-1. 各 issue を severity 順（critical → high → medium）に処理
+1. 各 issue を severity 順（critical → high → medium）、次にファイル順に処理
 2. 該当ファイルを Read で読み、Edit で修正を適用
-3. 修正後、直ちに構文チェック/ビルド確認:
-   - Rust: `cargo check`
+3. 修正後、直ちにビルド確認:
+   - Rust: `cargo check` (+ `cargo test` があれば実行)
    - TypeScript/JS: `npx tsc --noEmit` or `npm run build`
    - Python: `python -m py_compile`
-   - Go: `go build ./...`
-4. テストがあれば実行して regression がないか確認
-5. ビルド/テストが壊れた場合は修正をリバートし、issue をスキップ
+   - Go: `go vet ./...` && `go build ./...`
+4. ビルド/テストが壊れた場合は修正をリバートし、issue をスキップ
 
 #### Step 2d: 収束判定
 
-- 今ラウンドで severity >= threshold の issue が **0件** → 収束。ループ終了
+- 今ラウンドで severity >= threshold の issue が **0件** → **収束**。ループ終了
 - issue が前ラウンドより増えた → 修正が新たな問題を生んでいる可能性。ユーザーに確認
 - 最大ラウンドに到達 → 残存 issue を報告して終了
 
@@ -126,13 +169,18 @@ issue がない場合は以下を出力:
 
 **Rounds:** {completed}/{max}
 **Status:** Converged | Max rounds reached | Stopped by user
+**Reviewers:** Security(opus) + Logic(opus) + Performance(opus) [+ Codex]
 
-### Issues Found & Fixed
-| Round | Found | Fixed | Skipped | Severity Breakdown |
-|-------|-------|-------|---------|-------------------|
-| 1     | 5     | 5     | 0       | 1C 2H 2M          |
-| 2     | 2     | 2     | 0       | 0C 1H 1M          |
-| 3     | 0     | -     | -       | Converged          |
+### Issues by Round
+| Round | Reviewers | Found | Fixed | Skipped | Cross-validated |
+|-------|-----------|-------|-------|---------|-----------------|
+| 1     | 3         | 8     | 7     | 1       | 3               |
+| 2     | 3         | 2     | 2     | 0       | 0               |
+| 3     | 3         | 0     | -     | -       | Converged       |
+
+### Cross-validated Issues (複数レビュワーが同時指摘)
+これらは複数の独立した視点が同じ問題を発見したため、信頼度が高い:
+- **[file:line]** description (指摘元: Security + Logic)
 
 ### Remaining Issues (if any)
 - [ ] **[file:line]** description (reason skipped)
@@ -143,8 +191,11 @@ issue がない場合は以下を出力:
 
 ## 設計原則
 
-1. **独立コンテキスト**: 各ラウンドは新しいサブエージェントで実行。前ラウンドの修正を「自分の修正だから正しい」と見なすバイアスを排除
-2. **段階的収束**: 各ラウンドは前回の修正コードをレビューするため、見落としが段階的に減る
-3. **安全な修正**: ビルドが壊れたら即リバート。品質を下げる修正は適用しない
-4. **コスト制御**: sonnet ベースで回し、critical 検出時のみ opus で再検証。max-rounds で上限制御
-5. **透過性**: 各ラウンドの開始・結果をユーザーに表示し、進捗が見える
+1. **観点の分離**: 各レビュワーは自分の専門領域のみに集中。「セキュリティ担当がスタイルを指摘する」ような雑音を排除し、深いレビューを実現
+2. **モデル多様性**: 異なるモデル（Opus + Codex）は異なる盲点を持つ。複数モデルで同じ問題を発見したら確信度が上がる
+3. **並列実行**: 3〜4 レビュワーを同時起動し、待ち時間を最小化
+4. **独立コンテキスト**: 各ラウンド・各レビュワーは新しいサブエージェント。修正バイアスを排除
+5. **cross-validation**: 複数レビュワーが同じ問題を独立に発見 → severity を上げる。単独指摘より信頼度が高い
+6. **段階的収束**: 各ラウンドは前回の修正コードをレビューするため、見落としが段階的に減る
+7. **安全な修正**: ビルドが壊れたら即リバート。品質を下げる修正は適用しない
+8. **コスト意識**: max-rounds で上限制御。ラウンドが進むにつれ issue は減るので、コストも漸減する
