@@ -14,8 +14,9 @@ allowed-tools:
 
 # Review Loop - 収束型コードレビュー
 
-ローカルの変更に対して「レビュー → 修正 → 再レビュー」を issue が 0 になる（または最大ラウンド数に達する）まで繰り返します。
+ローカルの変更に対して「レビュー → 修正 → 再レビュー」をレビュワーが新たな問題を発見しなくなる（または最大ラウンド数に達する）まで繰り返します。
 LLM レビューは1回ごとに新しい視点で問題を発見するため、複数ラウンド回すことで品質が漸近的に向上します。
+`--severity` は自動修正の対象を制御するが、収束判定は全 severity の新規発見数で行う。
 
 **Announce at start:** "Review Loop を開始します。変更を分析して、観点別の並列レビューを収束するまで繰り返します。"
 
@@ -24,7 +25,7 @@ LLM レビューは1回ごとに新しい視点で問題を発見するため、
 $ARGUMENTS
 
 - `--max-rounds=N` (default: 5): 最大ラウンド数
-- `--severity=critical|high|medium|all` (default: high): 修正対象とする最低重要度
+- `--severity=critical|high|medium|all` (default: high): 自動修正する最低重要度（収束判定は全 severity で行う）
 - `--auto-fix` (default: true): 発見した問題を自動修正する。false なら報告のみ
 - `--scope=staged|all|file=<path>` (default: all): レビュー対象
 - `--codex` (default: false): OpenAI Codex にも並列でレビューさせる（モデル多様性）
@@ -252,11 +253,12 @@ CodeRabbit のようなレビューボットが高品質な指摘を出せる理
 1. 全レビュワーの出力を収集
 2. JSON Lines をパース
 3. 同一ファイル・同一行の重複 issue をマージ（複数レビュワーが同じ問題を指摘 → 確信度が高い）
-4. severity でフィルタリング:
-   - `--severity=critical` → critical のみ
-   - `--severity=high` → critical + high (デフォルト)
-   - `--severity=medium` → critical + high + medium
-   - `--severity=all` → 全部
+4. **自動修正対象**を severity でフィルタリング（`--severity` で指定）:
+   - `--severity=critical` → critical のみ修正
+   - `--severity=high` → critical + high を修正 (デフォルト)
+   - `--severity=medium` → critical + high + medium を修正
+   - `--severity=all` → 全部修正
+   - **注意**: 修正対象外の issue も記録し、収束判定に含める
 5. 複数レビュワーが指摘した issue は severity を1段階上げる（cross-validated）
 
 #### Step 2c: 修正の適用
@@ -323,9 +325,15 @@ Write ツールで `.claude/reviews/` ディレクトリに書き出す。ディ
 
 #### Step 2e: 収束判定
 
-- 今ラウンドで severity >= threshold の issue が **0件** → **収束**。ループ終了
+収束は「レビュワーが新たな問題を発見しなくなった」ことで判定する:
+
+- 今ラウンドで**全 severity を通じて新規 issue が 0件** → **収束**。ループ終了
+  - 「新規」= 前ラウンドで既に報告された issue の再指摘は除外
+  - severity threshold 以下の issue が残っていても、新規発見がなければ収束
 - issue が前ラウンドより増えた → 修正が新たな問題を生んでいる可能性。ユーザーに確認
 - 最大ラウンドに到達 → 残存 issue を報告して終了
+
+**なぜ全 severity で収束判定するか**: severity=high で修正を打ち切っても、medium の指摘が毎ラウンド新たに出続けるなら、コードにはまだ改善余地がある。レビュワーが「もう何も見つからない」と言うまで回すことで、真の品質収束を達成する。
 
 ### Phase 3: 結果サマリーの保存と出力
 
@@ -337,7 +345,7 @@ Write ツールで `.claude/reviews/` ディレクトリに書き出す。ディ
 ## Review Loop Summary
 
 **Rounds:** {completed}/{max}
-**Status:** Converged | Max rounds reached | Stopped by user
+**Status:** Converged (zero new findings) | Max rounds reached | Stopped by user
 **Reviewers:** Security(opus) + Logic(opus) + Performance(opus) + Completeness(opus) [+ Codex]
 
 ### Issues by Round
