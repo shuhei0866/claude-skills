@@ -16,6 +16,18 @@ set -euo pipefail
 # python3 の存在確認
 command -v python3 >/dev/null 2>&1 || { echo '{"error": "python3 is required but not found"}' >&2; exit 1; }
 
+# macOS には timeout がない場合がある (GNU coreutils)
+if command -v timeout >/dev/null 2>&1; then
+  _timeout() { timeout "$@"; }
+elif command -v gtimeout >/dev/null 2>&1; then
+  _timeout() { gtimeout "$@"; }
+else
+  _timeout() {
+    local duration="$1"; shift
+    perl -e 'alarm shift; exec @ARGV' "$duration" "$@"
+  }
+fi
+
 # --- defaults ---
 BROWSER="auto"
 ALL_TABS=false
@@ -59,7 +71,7 @@ fi
 # --- auto-detect browser ---
 detect_browser() {
   local front
-  front=$(timeout 5 osascript -e 'tell application "System Events" to get name of first application process whose frontmost is true' 2>/dev/null || echo "")
+  front=$(_timeout 5 osascript -e 'tell application "System Events" to get name of first application process whose frontmost is true' 2>/dev/null || echo "")
   case "$front" in
     "Google Chrome") echo "chrome" ;;
     "Arc")           echo "arc" ;;
@@ -84,7 +96,7 @@ get_chrome_active() {
   local app_name="Google Chrome"
   [[ "$BROWSER" == "arc" ]] && app_name="Arc"
 
-  timeout 10 osascript <<EOF 2>/dev/null
+  _timeout 10 osascript <<EOF 2>/dev/null
 tell application "$app_name"
   set theURL to URL of active tab of front window
   set theTitle to title of active tab of front window
@@ -98,7 +110,7 @@ get_chrome_all_tabs() {
   local app_name="Google Chrome"
   [[ "$BROWSER" == "arc" ]] && app_name="Arc"
 
-  timeout 15 osascript <<EOF 2>/dev/null
+  _timeout 15 osascript <<EOF 2>/dev/null
 tell application "$app_name"
   set output to ""
   set winList to every window
@@ -118,7 +130,7 @@ get_chrome_content() {
   local app_name="Google Chrome"
   [[ "$BROWSER" == "arc" ]] && app_name="Arc"
 
-  timeout 15 osascript <<OUTER_EOF 2>/dev/null
+  _timeout 15 osascript <<OUTER_EOF 2>/dev/null
 tell application "$app_name"
   set theContent to execute active tab of front window javascript "
     (function() {
@@ -137,7 +149,7 @@ OUTER_EOF
 
 # --- Safari: active tab ---
 get_safari_active() {
-  timeout 10 osascript <<'EOF' 2>/dev/null
+  _timeout 10 osascript <<'EOF' 2>/dev/null
 tell application "Safari"
   set theURL to URL of current tab of front window
   set theTitle to name of current tab of front window
@@ -148,7 +160,7 @@ EOF
 
 # --- Safari: all tabs ---
 get_safari_all_tabs() {
-  timeout 15 osascript <<'EOF' 2>/dev/null
+  _timeout 15 osascript <<'EOF' 2>/dev/null
 tell application "Safari"
   set output to ""
   set winList to every window
@@ -166,7 +178,7 @@ EOF
 # --- Safari: page content via JS ---
 # 注意: Safari → 開発メニュー → 「Apple Events からの JavaScript を許可」が必要
 get_safari_content() {
-  timeout 15 osascript <<'EOF' 2>/dev/null
+  _timeout 15 osascript <<'EOF' 2>/dev/null
 tell application "Safari"
   set theContent to do JavaScript "
     (function() {
@@ -201,7 +213,8 @@ if pages:
     t = pages[0]
     print(json.dumps({'url': t.get('url',''), 'title': t.get('title',''), 'source': 'cdp', 'port': port}, ensure_ascii=False, indent=2))
 else:
-    print(json.dumps({'error': 'no page targets'}))" "$port" 2>/dev/null
+    print(json.dumps({'error': 'no page targets'}), file=sys.stderr)
+    sys.exit(1)" "$port" 2>/dev/null
 }
 
 # --- 安全な JSON 出力 (python3 経由で全値をエスケープ) ---
