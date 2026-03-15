@@ -177,7 +177,26 @@ WARN
   exit 0
 }
 
+# --- ブランチベースの動的スキップ ---
+# release/* ブランチ以外では release 系ガードをスキップ
+# main/develop 以外のブランチでは一部ガードを緩和
+_check_branch_context() {
+  local caller_script
+  caller_script=$(basename "${BASH_SOURCE[${#BASH_SOURCE[@]}-1]}" .sh)
+
+  local current_branch
+  current_branch=$(git branch --show-current 2>/dev/null || echo "")
+
+  # pr-merge-ready-guard は release/* ブランチでのみ意味がある
+  if [ "$caller_script" = "pr-merge-ready-guard" ]; then
+    if [[ ! "$current_branch" =~ ^release/ ]]; then
+      exit 0
+    fi
+  fi
+}
+
 # 初期化: source された時点で設定をロード
 _load_guard_level
 _load_guard_skip
 _check_skip
+_check_branch_context
